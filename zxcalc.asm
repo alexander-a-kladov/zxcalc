@@ -82,8 +82,6 @@ ReadKey:
         LD      (KeyChar),A
 
         LD      A,B
-        CP      #18
-        JR      Z,DecodeSymbolKey
         CP      #27
         JR      Z,DecodeCapsKey
         CP      #FF
@@ -94,7 +92,7 @@ ReadKey:
         CP      13
         JR      Z,ReadDone
         CALL    IsHexCharacter
-        JR      C,WaitKeyRelease
+        JR      C,DecodeSymbolKey
         JR      StoreCharacter
 
 DecodeSymbolKey:
@@ -447,14 +445,13 @@ HaveHighDigit:
         RLCA
         RLCA
         OR      C
+        DEC	HL
 StoreLiteralByte:
+	LD      (ScanPtr),HL
         LD      HL,(WritePtr)
         LD      (HL),A
         INC     HL
         LD      (WritePtr),HL
-        LD      HL,(ScanPtr)
-        DEC     HL
-        LD      (ScanPtr),HL
         DJNZ    LiteralByteLoop
         ; Trim redundant most-significant zero bytes, retaining one byte.
         LD      A,(LiteralByteCount)
