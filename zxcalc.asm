@@ -10,9 +10,9 @@
 ;   00=01+2B                 add two variables
 ;   00                       print a variable
 ;
-; Input is read through the Spectrum ROM input stream (RST 18), so the ROM
-; keyboard/editor handles the physical keyboard and ENTER. The program does
-; not scan the keyboard matrix itself.
+; Input uses ROM KEY-SCAN + K-TEST, with one-key-per-press debouncing.
+; Commands are parsed and range-checked before execution; accepted commands
+; print an explicit success message, rejected commands print an error.
 ;
 ; NOTE: This source is a first complete implementation; assemble and test in
 ; an emulator before relying on it. It deliberately keeps the original
@@ -29,7 +29,7 @@ MAX_LINE        EQU     520
 
 Start:
         DI
-        ; Keep interrupts enabled during normal ROM keyboard input.
+        LD      SP,#FF00          ; stack in upper part of the currently paged RAM bank
         EI
         CALL    ClearScreen
         LD      HL,Title
@@ -57,46 +57,137 @@ CommandError:
 ; -----------------------------------------------------------------------------
 ; Input line. RST 18 reads from current ROM input channel. ENTER = 13.
 ; Backspace (12 or 8) removes one character. CmdLen is a 16-bit count.
+; ----------------------------------------------------------; -----------------------------------------------------------------------------
+; Keyboard line editor.
+; KEY-SCAN ($028E) returns raw key positions in DE.
+; K-TEST ($031E) converts them to main key codes:
+;   B=$FF no shift, B=$18 SYMBOL SHIFT, B=$27 CAPS SHIFT.
+; Accepted: 0-9, A-F, SYMBOL SHIFT+K (+), SYMBOL SHIFT+L (=),
+;           CAPS SHIFT+0 (DELETE/BACKSPACE), ENTER.
 ; -----------------------------------------------------------------------------
 ReadLine:
         LD      HL,0
         LD      (CmdLen),HL
         LD      IX,CmdBuf
-ReadLoop:
-        RST     #18
+
+ReadKey:
+        CALL    #028E
+        JR      NZ,ReadKey        ; reject invalid multi-key combinations
+        LD      A,E
+        CP      #FF
+        JR      Z,ReadKey         ; no key
+
+        CALL    #031E             ; K-TEST: A=main key, B=shift, Carry=valid
+        JR      NC,WaitKeyRelease
+        LD      (KeyChar),A
+
+        LD      A,B
+        CP      #18
+        JR      Z,DecodeSymbolKey
+        CP      #27
+        JR      Z,DecodeCapsKey
+        CP      #FF
+        JR      NZ,WaitKeyRelease
+
+        ; No shift: ENTER or a hexadecimal digit/letter.
+        LD      A,(KeyChar)
         CP      13
         JR      Z,ReadDone
-        CP      12
-        JR      Z,ReadBackspace
-        CP      8
-        JR      Z,ReadBackspace
+        CALL    IsHexCharacter
+        JR      C,WaitKeyRelease
+        JR      StoreCharacter
+
+DecodeSymbolKey:
+        LD      A,(KeyChar)
+        CP      'K'
+        JR      Z,MakePlus
+        CP      'L'
+        JR      Z,MakeEquals
+        JR      WaitKeyRelease
+MakePlus:
+        LD      A,'+'
+        JR      StoreCharacter
+MakeEquals:
+        LD      A,'='
+        JR      StoreCharacter
+
+DecodeCapsKey:
+        LD      A,(KeyChar)
+        CP      '0'
+        JR      Z,BackspaceCharacter
+        JR      WaitKeyRelease
+
+StoreCharacter:
+        LD      C,A
         LD      HL,(CmdLen)
         LD      DE,MAX_LINE
         OR      A
         SBC     HL,DE
-        JR      NC,ReadLoop
+        JR      NC,WaitKeyRelease
+        LD      A,C
         LD      (IX+0),A
         INC     IX
         LD      HL,(CmdLen)
         INC     HL
         LD      (CmdLen),HL
-        JR      ReadLoop
-ReadBackspace:
+        LD      A,C
+        RST     #10               ; echo typed character
+        JR      WaitKeyRelease
+
+BackspaceCharacter:
         LD      HL,(CmdLen)
         LD      A,H
         OR      L
-        JR      Z,ReadLoop
+        JR      Z,WaitKeyRelease
         DEC     HL
         LD      (CmdLen),HL
         DEC     IX
-        JR      ReadLoop
+        LD      A,8
+        RST     #10
+        LD      A,' '
+        RST     #10
+        LD      A,8
+        RST     #10
+        JR      WaitKeyRelease
+
 ReadDone:
+        CALL    WaitAllKeysUp       ; do not treat a held ENTER as another command
         XOR     A
         LD      (IX+0),A
         LD      A,13
         RST     #10
-        LD      A,10
-        RST     #10
+        RET
+
+; Wait for every key, including a shift key, to be released.
+WaitKeyRelease:
+        CALL    WaitAllKeysUp
+        JP      ReadKey
+
+WaitAllKeysUp:
+        CALL    #028E
+        LD      A,D
+        CP      #FF
+        JR      NZ,WaitAllKeysUp
+        LD      A,E
+        CP      #FF
+        JR      NZ,WaitAllKeysUp
+        RET
+
+; A=character. Carry set unless it is 0-9 or A-F.
+IsHexCharacter:
+        CP      '0'
+        JR      C,NotHexCharacter
+        CP      '9'+1
+        JR      C,HexCharacterOK
+        CP      'A'
+        JR      C,NotHexCharacter
+        CP      'F'+1
+        JR      NC,NotHexCharacter
+HexCharacterOK:
+        OR      A
+        RET
+NotHexCharacter:
+        SCF
         RET
 
 ; -----------------------------------------------------------------------------
@@ -146,8 +237,6 @@ PrintVariable:
         INC     HL
         CALL    PrintBigHex
         LD      A,13
-        RST     #10
-        LD      A,10
         RST     #10
         OR      A
         RET
@@ -646,12 +735,13 @@ ClearScreen:
 ; Text and working storage. Keep all program/data above C600; variable slots
 ; are a separate fixed area at 8600-C5FF.
 ; -----------------------------------------------------------------------------
-Title:          DB "ZX BIG INTEGER CALCULATOR",13,10,0
+Title:          DB "ZX BIG INTEGER CALCULATOR",13,0
 Prompt:         DB "> ",0
-OkText:         DB "OK",13,10,0
-ErrorText:      DB "ERROR",13,10,0
+OkText:         DB "OK - COMMAND ACCEPTED",13,0
+ErrorText:      DB "ERROR - INVALID COMMAND",13,0
 
 CmdLen:         DW 0
+KeyChar:        DB 0
 RhsOffset:      DW 0
 ScanPtr:        DW 0
 WritePtr:       DW 0
