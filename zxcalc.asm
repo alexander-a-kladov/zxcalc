@@ -78,7 +78,7 @@ ReadKey:
         JR      Z,ReadKey         ; no key
 
         CALL    #031E             ; K-TEST: A=main key, B=shift, Carry=valid
-        JR      NC,WaitKeyRelease
+        JP      NC,WaitKeyRelease
         LD      (KeyChar),A
 
         LD      A,B
@@ -101,6 +101,10 @@ DecodeSymbolKey:
         JR      Z,MakePlus
         CP      'L'
         JR      Z,MakeEquals
+        CP	'G'
+        JR	Z,MakeMultiply
+        CP	'Z'
+        CALL	Z,ClearScreen
         JR      WaitKeyRelease
 MakePlus:
         LD      A,'+'
@@ -108,7 +112,9 @@ MakePlus:
 MakeEquals:
         LD      A,'='
         JR      StoreCharacter
-
+MakeMultiply:
+	LD	A,'*'
+	JR	StoreCharacter
 DecodeCapsKey:
         LD      A,(KeyChar)
         CP      '0'
@@ -249,25 +255,32 @@ ParseAssignment:
         SBC     HL,DE
         POP     HL
         JP      NZ,ParseLiteral
-        ; Length is 8: two-char destination, '=', two-char source, '+', two-char source.
+        ; Length is 8: two-char destination, '=', two-char source, '+' or '*', two-char source.
         PUSH    HL
         INC     HL
         INC     HL
         LD      A,(HL)
-        CP      '+'
-        POP     HL
-        JR      NZ,ParseLiteral
+        LD	(FuncSymb),A
+        CP	'+'
+        JR	Z,.parseAssig1
+        CP	'*'
+.parseAssig1:
+	POP     HL
+        JP      NZ,ParseLiteral
         CALL    ParseAddExpression
         RET
 
-; Parse expression at HL: var '+' var. Destination index saved already.
+; Parse expression at HL: var '+' var, or var '*' var. Destination index saved already.
 ParseAddExpression:
         CALL    ParseVarIndex
         RET     C
         LD      (Src1Index),A
         LD      A,(HL)
         CP      '+'
-        SCF
+        JR	Z,.parseAdd1
+        CP	'*'
+.parseAdd1:
+	SCF
         RET     NZ
         INC     HL
         CALL    ParseVarIndex
@@ -322,7 +335,18 @@ AddSrc2Ready:
         INC     HL
         LD      (Ptr2),HL
         ; Add into a separate work buffer so destination may equal either source.
-        CALL    AddToWork
+        LD	A,(FuncSymb)
+	CP	'+'
+	JR	NZ,.addsrc2_mul
+	CALL	AddToWork
+	JR	.addscr2_ret
+.addsrc2_mul:
+	CP	'*'
+	JR	NZ,.addscr2_div
+	CALL	MulToWork
+	JR	.addscr2_ret
+.addscr2_div:
+.addscr2_ret:
         RET     C
         ; Commit result to destination slot only after successful addition.
         LD      A,(DestIndex)
@@ -610,6 +634,300 @@ AddOverflow:
         SCF
         RET
 
+; ------------------------------------------------------------
+; Mul8
+;
+; Умножение 8 бит × 8 бит.
+;
+; Вход:
+;   A = множитель 1
+;   E = множитель 2
+;
+; Выход:
+;   HL = произведение
+;
+; Изменяет:
+;   AF, BC, E, HL
+; ------------------------------------------------------------
+
+Mul8:
+
+    ld c,a
+    ld b,0
+
+    ld hl,0
+
+    ld a,8
+
+.mul8_loop:
+
+    srl e
+    jr nc,.mul8_no_add
+
+    add hl,bc
+
+.mul8_no_add:
+
+    sla c
+    rl b
+
+    dec a
+    jr nz,.mul8_loop
+
+    ret
+
+; ------------------------------------------------------------
+; MulToWork
+;
+; Умножение двух беззнаковых длинных чисел.
+;
+; Вход:
+;   Ptr1    - адрес первого числа
+;   Ptr2    - адрес второго числа
+;   Len1    - длина первого числа
+;   Len2    - длина второго числа
+;
+; Выход:
+;   WorkBuf - младшие 255 байт результата
+;   WorkLen - длина результата (0..255)
+;   C       - 1 при переполнении, иначе 0
+;
+; Использует:
+;   MulTmp  - промежуточный буфер 510 байт
+;
+; Изменяет:
+;   AF, BC, DE, HL, IX, IY
+; ------------------------------------------------------------
+
+MulToWork:
+
+    ; Обнуление промежуточного буфера
+
+    ld hl,MulTmp
+    ld bc,2*MAX_BYTES
+
+.mul_clear:
+    ld (hl),0
+    inc hl
+    dec bc
+    ld a,b
+    or c
+    jr nz,.mul_clear
+
+    ; Проверка нулевых операндов
+
+    ld a,(Len1)
+    or a
+    jr z,.mul_finish
+
+    ld a,(Len2)
+    or a
+    jr z,.mul_finish
+
+    ; Инициализация указателей
+
+    ld hl,(Ptr1)
+    ld (MulAPtr),hl
+
+    ld hl,MulTmp
+    ld (MulRowPtr),hl
+
+    ld a,(Len1)
+    ld (MulOuter),a
+
+; ------------------------------------------------------------
+; Внешний цикл: байты первого множителя
+; ------------------------------------------------------------
+
+.mul_outer:
+
+    ; Читаем очередной байт первого числа
+
+    ld hl,(MulAPtr)
+    ld a,(hl)
+    ld (MulA),a
+
+    ; IX = начало текущей строки результата
+
+    ld ix,(MulRowPtr)
+
+    ; IY = начало второго множителя
+
+    ld iy,(Ptr2)
+
+    ld a,(Len2)
+    ld (MulInner),a
+
+; ------------------------------------------------------------
+; Внутренний цикл: байты второго множителя
+; ------------------------------------------------------------
+
+.mul_inner:
+
+    ; Умножаем MulA на очередной байт второго числа
+
+    ld e,(iy+0)
+    ld a,(MulA)
+
+    call Mul8
+
+    ; HL = 16-битное произведение
+    ;
+    ; Добавляем его в MulTmp[IX]
+
+    ld a,(ix+0)
+    add a,l
+    ld (ix+0),a
+
+    ld a,(ix+1)
+    adc a,h
+    ld (ix+1),a
+
+    ; Распространение переноса
+
+    jr nc,.mul_no_carry
+
+    push ix
+
+    inc ix
+    inc ix
+
+.mul_propagate:
+
+    ld a,(ix+0)
+    adc a,0
+    ld (ix+0),a
+
+    inc ix
+    jr c,.mul_propagate
+
+    pop ix
+
+.mul_no_carry:
+
+    ; Следующий байт второго множителя
+
+    inc iy
+    inc ix
+
+    ld a,(MulInner)
+    dec a
+    ld (MulInner),a
+    jr nz,.mul_inner
+
+    ; Следующая строка результата
+
+    ld hl,(MulRowPtr)
+    inc hl
+    ld (MulRowPtr),hl
+
+    ; Следующий байт первого множителя
+
+    ld hl,(MulAPtr)
+    inc hl
+    ld (MulAPtr),hl
+
+    ld a,(MulOuter)
+    dec a
+    ld (MulOuter),a
+    jr nz,.mul_outer
+
+; ------------------------------------------------------------
+; Формирование результата
+; ------------------------------------------------------------
+
+.mul_finish:
+
+    ; Копируем младшие 255 байт в WorkBuf
+
+    ld hl,MulTmp
+    ld de,WorkBuf
+    ld bc,MAX_BYTES
+
+.mul_copy:
+
+    ld a,(hl)
+    ld (de),a
+
+    inc hl
+    inc de
+
+    dec bc
+    ld a,b
+    or c
+    jr nz,.mul_copy
+
+    ; Проверяем старшие 255 байт.
+    ; Если хотя бы один байт ненулевой - переполнение.
+
+    ld hl,MulTmp+MAX_BYTES
+    ld b,MAX_BYTES
+
+    xor a
+
+.mul_check_overflow:
+
+    ld a,(hl)
+    or a
+    jr nz,.mul_overflow
+
+    inc hl
+    djnz .mul_check_overflow
+
+    xor a
+    ld (MulOverflow),a
+    jr .mul_length
+
+.mul_overflow:
+
+    ld a,1
+    ld (MulOverflow),a
+
+; ------------------------------------------------------------
+; Вычисление фактической длины результата
+; ------------------------------------------------------------
+
+.mul_length:
+
+    ld hl,WorkBuf+MAX_BYTES-1
+    ld b,MAX_BYTES
+
+.mul_length_loop:
+
+    ld a,(hl)
+    or a
+    jr nz,.mul_length_found
+
+    dec hl
+    djnz .mul_length_loop
+
+    ; Результат равен нулю
+
+    xor a
+    ld (WorkLen),a
+    jr .mul_return
+
+.mul_length_found:
+
+    ; B содержит длину результата
+
+    ld a,b
+    ld (WorkLen),a
+
+; ------------------------------------------------------------
+; Возврат флага переполнения
+; ------------------------------------------------------------
+
+.mul_return:
+
+    ld a,(MulOverflow)
+    or a
+    ret z
+
+    scf
+    ret
+
+
 ; -----------------------------------------------------------------------------
 ; Parse exactly two hex digits at HL as a variable index 0..63.
 ; Returns A=index, HL advanced by 2, Carry on error.
@@ -724,8 +1042,7 @@ PrintString:
         JR      PrintString
 
 ClearScreen:
-        LD      A,12
-        RST     #10
+        CALL	3503
         RET
 
 ; -----------------------------------------------------------------------------
@@ -742,8 +1059,9 @@ KeyChar:        DB 0
 RhsOffset:      DW 0
 ScanPtr:        DW 0
 WritePtr:       DW 0
-Ptr1:           DW 0
-Ptr2:           DW 0
+Ptr1:           DW 0	; Addr1
+Ptr2:           DW 0	; Addr2
+FuncSymb:	DB 0	; function '+','*'
 DestIndex:      DB 0
 Src1Index:      DB 0
 Src2Index:      DB 0
@@ -755,5 +1073,12 @@ LiteralByteCount: DB 0
 DestLenTemp:    DB 0
 CmdBuf:         DS MAX_LINE+1,0
 WorkBuf:        DS MAX_BYTES,0
+MulTmp:         DS 2*MAX_BYTES,0
+MulAPtr:        DW 0
+MulRowPtr:      DW 0
+MulA:           DB 0
+MulOuter:       DB 0
+MulInner:       DB 0
+MulOverflow:    DB 0
 
         SAVESNA "zxcalc.sna",Start
