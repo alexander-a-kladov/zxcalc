@@ -85,7 +85,7 @@ ReadKey:
         CP      #27
         JR      Z,DecodeCapsKey
         CP      #FF
-        JR      NZ,WaitKeyRelease
+        JP      NZ,WaitKeyRelease
 
         ; No shift: ENTER or a hexadecimal digit/letter.
         LD      A,(KeyChar)
@@ -103,8 +103,10 @@ DecodeSymbolKey:
         JR      Z,MakeEquals
         CP	'G'
         JR	Z,MakeMultiply
-        CP	'Z'
-        CALL	Z,ClearScreen
+        CP	'V'
+        JR	Z,MakeDivision
+        CP	'M'
+        JR	Z,MakeRemainder
         JR      WaitKeyRelease
 MakePlus:
         LD      A,'+'
@@ -114,6 +116,12 @@ MakeEquals:
         JR      StoreCharacter
 MakeMultiply:
 	LD	A,'*'
+	JR	StoreCharacter
+MakeDivision:
+	LD	A,'/'
+	JR	StoreCharacter
+MakeRemainder:
+	LD	A,'M'
 	JR	StoreCharacter
 DecodeCapsKey:
         LD      A,(KeyChar)
@@ -255,7 +263,7 @@ ParseAssignment:
         SBC     HL,DE
         POP     HL
         JP      NZ,ParseLiteral
-        ; Length is 8: two-char destination, '=', two-char source, '+' or '*', two-char source.
+        ; Length is 8: two-char destination, '=', two-char source, '+','*','/' or 'M', two-char source.
         PUSH    HL
         INC     HL
         INC     HL
@@ -264,13 +272,17 @@ ParseAssignment:
         CP	'+'
         JR	Z,.parseAssig1
         CP	'*'
+        JR	Z,.parseAssig1
+        CP	'/'
+        JR	Z,.parseAssig1
+        CP	'M'
 .parseAssig1:
 	POP     HL
         JP      NZ,ParseLiteral
         CALL    ParseAddExpression
         RET
 
-; Parse expression at HL: var '+' var, or var '*' var. Destination index saved already.
+; Parse expression at HL: var '+':'*':'/':'M' var. Destination index saved already.
 ParseAddExpression:
         CALL    ParseVarIndex
         RET     C
@@ -279,6 +291,10 @@ ParseAddExpression:
         CP      '+'
         JR	Z,.parseAdd1
         CP	'*'
+        JR	Z,.parseAdd1
+        CP	'/'
+        JR	Z,.parseAdd1
+        CP	'M'
 .parseAdd1:
 	SCF
         RET     NZ
@@ -346,6 +362,14 @@ AddSrc2Ready:
 	CALL	MulToWork
 	JR	.addscr2_ret
 .addscr2_div:
+	CP	'/'
+	JR	NZ,.addscr2_mod
+	CALL	DivToWork
+	JR	.addscr2_ret
+.addscr2_mod:
+	CP	'M'
+	JR	NZ,.addscr2_ret
+	CALL	ModToWork
 .addscr2_ret:
         RET     C
         ; Commit result to destination slot only after successful addition.
@@ -927,6 +951,385 @@ MulToWork:
     scf
     ret
 
+; Частное A / B
+
+DivToWork:
+    xor a
+    ld (DivMode),a
+    jp DivCore
+
+
+; Остаток A mod B
+
+ModToWork:
+    ld a,1
+    ld (DivMode),a
+    jp DivCore
+
+; ------------------------------------------------------------
+; DivCore
+;
+; Вход:
+;   Ptr1  - делимое
+;   Len1  - длина делимого
+;   Ptr2  - делитель
+;   Len2  - длина делителя
+;
+; DivMode:
+;   0 = частное
+;   1 = остаток
+;
+; Выход:
+;   WorkBuf
+;   WorkLen
+;
+;   C = 1 - деление на ноль
+;   C = 0 - успешно
+;
+; Изменяет:
+;   AF, BC, DE, HL, IX, IY
+; ------------------------------------------------------------
+
+DivCore:
+
+    ; Обнуление WorkBuf
+
+    ld hl,WorkBuf
+    ld bc,MAX_BYTES
+
+.div_clear_work:
+    ld (hl),0
+    inc hl
+    dec bc
+    ld a,b
+    or c
+    jr nz,.div_clear_work
+
+    xor a
+    ld (WorkLen),a
+
+    ; Обнуление DivRem
+
+    ld hl,DivRem
+    ld bc,MAX_BYTES+1
+
+.div_clear_rem:
+    ld (hl),0
+    inc hl
+    dec bc
+    ld a,b
+    or c
+    jr nz,.div_clear_rem
+
+    ; Обнуление DivisorBuf
+
+    ld hl,DivisorBuf
+    ld bc,MAX_BYTES+1
+
+.div_clear_divisor:
+    ld (hl),0
+    inc hl
+    dec bc
+    ld a,b
+    or c
+    jr nz,.div_clear_divisor
+
+    ; Копирование делителя
+
+    ld a,(Len2)
+    or a
+    jp z,.div_zero_error
+
+    ld b,a
+    ld hl,(Ptr2)
+    ld de,DivisorBuf
+
+.div_copy_divisor:
+    ld a,(hl)
+    ld (de),a
+    inc hl
+    inc de
+    djnz .div_copy_divisor
+
+    ; Проверка делителя на ноль
+
+    ld hl,DivisorBuf
+    ld b,0
+    xor a
+
+.div_check_zero:
+    or (hl)
+    inc hl
+    djnz .div_check_zero
+
+    jp z,.div_zero_error
+
+    ; Проверка нулевого делимого
+
+    ld a,(Len1)
+    or a
+    jp z,.div_success
+
+    ; --------------------------------------------------------
+    ; Подготовка указателей
+    ; --------------------------------------------------------
+
+    ; DivSrcPtr = Ptr1 + Len1 - 1
+
+    ld hl,(Ptr1)
+    ld a,(Len1)
+    ld e,a
+    ld d,0
+    add hl,de
+    dec hl
+    ld (DivSrcPtr),hl
+
+    ; DivQPtr = WorkBuf + Len1 - 1
+
+    ld hl,WorkBuf
+    ld a,(Len1)
+    ld e,a
+    ld d,0
+    add hl,de
+    dec hl
+    ld (DivQPtr),hl
+
+    ld a,(Len1)
+    ld (DivSrcLeft),a
+
+; ------------------------------------------------------------
+; Внешний цикл: обработка байтов делимого
+; От старшего байта к младшему
+; ------------------------------------------------------------
+
+.div_outer:
+
+    ; Читаем очередной байт делимого
+
+    ld hl,(DivSrcPtr)
+    ld a,(hl)
+    ld (DivCurrent),a
+
+    ; Начинаем со старшего бита
+
+    ld a,#80
+    ld (DivMask),a
+
+    ld a,8
+    ld (DivBitCount),a
+
+; ------------------------------------------------------------
+; Внутренний цикл: обработка битов
+; ------------------------------------------------------------
+
+.div_bit:
+
+    ; --------------------------------------------------------
+    ; Сдвигаем остаток влево на 1 бит
+    ; Добавляем очередной бит делимого
+    ; --------------------------------------------------------
+
+    ld a,(DivCurrent)
+    ld c,a
+
+    ld a,(DivMask)
+    and c
+
+    jr z,.div_bit_zero
+
+    scf
+    jr .div_shift
+
+.div_bit_zero:
+    or a
+
+.div_shift:
+
+    ld ix,DivRem
+    ld b,0
+
+.div_shift_loop:
+
+    rl (ix+0)
+    inc ix
+    djnz .div_shift_loop
+
+    ; --------------------------------------------------------
+    ; Сравнение DivRem с DivisorBuf
+    ;
+    ; Сравниваем от старшего байта к младшему
+    ; --------------------------------------------------------
+
+    ld ix,DivRem+MAX_BYTES
+    ld iy,DivisorBuf+MAX_BYTES
+
+    ld b,0
+
+.div_compare:
+
+    ld a,(ix+0)
+    ld c,a
+
+    ld a,(iy+0)
+    cp c
+
+    jr c,.div_rem_greater
+    jr nz,.div_rem_less
+
+    dec ix
+    dec iy
+
+    djnz .div_compare
+
+    ; Равны: остаток >= делитель
+
+    jr .div_subtract
+
+.div_rem_less:
+
+    ; Остаток меньше делителя.
+    ; Бит частного остаётся равным нулю.
+
+    jr .div_next_bit
+
+.div_rem_greater:
+
+    ; Остаток больше делителя.
+
+; ------------------------------------------------------------
+; Вычитание DivRem = DivRem - DivisorBuf
+; ------------------------------------------------------------
+
+.div_subtract:
+
+    ld ix,DivRem
+    ld iy,DivisorBuf
+
+    ld b,0
+    or a
+
+.div_subtract_loop:
+
+    ld c,(iy+0)
+    ld a,(ix+0)
+    sbc a,c
+    ld (ix+0),a
+
+    inc ix
+    inc iy
+
+    djnz .div_subtract_loop
+
+    ; Устанавливаем очередной бит частного
+
+    ld hl,(DivQPtr)
+
+    ld a,(hl)
+    ld c,a
+
+    ld a,(DivMask)
+    or c
+
+    ld (hl),a
+
+; ------------------------------------------------------------
+; Следующий бит делимого
+; ------------------------------------------------------------
+
+.div_next_bit:
+
+    ; Сдвигаем маску вправо
+
+    ld a,(DivMask)
+    srl a
+    ld (DivMask),a
+
+    ld a,(DivBitCount)
+    dec a
+    ld (DivBitCount),a
+
+    jr nz,.div_bit
+
+    ; Следующий байт делимого
+
+    ld hl,(DivSrcPtr)
+    dec hl
+    ld (DivSrcPtr),hl
+
+    ; Следующий байт частного
+
+    ld hl,(DivQPtr)
+    dec hl
+    ld (DivQPtr),hl
+
+    ld a,(DivSrcLeft)
+    dec a
+    ld (DivSrcLeft),a
+
+    jp nz,.div_outer
+
+; ------------------------------------------------------------
+; Выбор результата
+; ------------------------------------------------------------
+
+.div_success:
+
+    ld a,(DivMode)
+    or a
+    jr z,.div_trim
+
+    ; Режим остатка:
+    ; копируем DivRem в WorkBuf
+
+    ld hl,DivRem
+    ld de,WorkBuf
+    ld bc,MAX_BYTES
+    ldir
+
+; ------------------------------------------------------------
+; Удаление ведущих нулей
+; ------------------------------------------------------------
+
+.div_trim:
+
+    ld hl,WorkBuf+MAX_BYTES-1
+    ld b,MAX_BYTES
+
+.div_trim_loop:
+
+    ld a,(hl)
+    or a
+    jr nz,.div_trim_found
+
+    dec hl
+    djnz .div_trim_loop
+
+    ; Результат равен нулю
+
+    xor a
+    ld (WorkLen),a
+    ret
+
+.div_trim_found:
+
+    ld a,b
+    ld (WorkLen),a
+
+    or a
+    ret
+
+; ------------------------------------------------------------
+; Деление на ноль
+; ------------------------------------------------------------
+
+.div_zero_error:
+
+    xor a
+    ld (WorkLen),a
+
+    scf
+    ret
+
 
 ; -----------------------------------------------------------------------------
 ; Parse exactly two hex digits at HL as a variable index 0..63.
@@ -1061,7 +1464,7 @@ ScanPtr:        DW 0
 WritePtr:       DW 0
 Ptr1:           DW 0	; Addr1
 Ptr2:           DW 0	; Addr2
-FuncSymb:	DB 0	; function '+','*'
+FuncSymb:	DB 0	; function '+','*','/'
 DestIndex:      DB 0
 Src1Index:      DB 0
 Src2Index:      DB 0
@@ -1080,5 +1483,14 @@ MulA:           DB 0
 MulOuter:       DB 0
 MulInner:       DB 0
 MulOverflow:    DB 0
+DivRem:         DS MAX_BYTES+1,0
+DivisorBuf:     DS MAX_BYTES+1,0
 
+DivMode:        DB 0
+DivSrcPtr:      DW 0
+DivQPtr:        DW 0
+DivSrcLeft:     DB 0
+DivCurrent:     DB 0
+DivMask:        DB 0
+DivBitCount:    DB 0
         SAVESNA "zxcalc.sna",Start
