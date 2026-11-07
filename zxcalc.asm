@@ -2,13 +2,20 @@
 ; ZX BIG INTEGER CALCULATOR for ZX Spectrum 128
 ; SjASMPlus source. Variables: $8600-$C5FF (64 slots x 256 bytes)
 ;
-; Slot layout: +0 = byte length (1..255), +1..+255 = unsigned value,
+; Slot layout: +0 = byte length (1..255), +1..+255 = unsigned magnitude,
 ; little-endian. Input/output notation is most-significant byte first.
+; The sign of each variable is kept separately in NumberSigns[index]
+; (0 = positive, 1 = negative). Zero is always positive.
 ;
 ; Commands:
 ;   2B=23049209348BCD32423    assign hexadecimal constant
-;   00=01+2B                 add two variables
-;   00                       print a variable
+;   2B=-23049209348BCD32423   assign negative constant (key J = '-')
+;   00=01+2B                  add two variables      (signed)
+;   00=01-2B                  subtract               (signed)
+;   00=01*2B                  multiply               (signed)
+;   00=01/2B                  divide, truncated toward zero
+;   00=01M2B                  remainder, sign of the dividend (a = (a/b)*b + a M b)
+;   00                        print a variable (with leading '-' if negative)
 ;
 ; Input uses ROM KEY-SCAN + K-TEST, with one-key-per-press debouncing.
 ; Commands are parsed and range-checked before execution; accepted commands
@@ -44,6 +51,7 @@ MainLoop:
         OR      L
         JR      Z,MainLoop
         CALL    ParseCommand
+        LD      IY,#5C3A         ; Mul/Div use IY; the ROM print routine needs it intact
         JR      C,CommandError
 ;        LD      HL,OkText
 ;       CALL    PrintString
@@ -99,6 +107,8 @@ DecodeSymbolKey:
         LD      A,(KeyChar)
         CP      'K'
         JR      Z,MakePlus
+        CP      'J'
+        JR      Z,MakeMinus
         CP      'L'
         JR      Z,MakeEquals
         CP	'G'
@@ -115,6 +125,9 @@ MakePlus:
         JR      StoreCharacter
 MakeEquals:
         LD      A,'='
+        JR      StoreCharacter
+MakeMinus:
+        LD      A,'-'
         JR      StoreCharacter
 MakeMultiply:
 	LD	A,'*'
@@ -248,6 +261,9 @@ BareVarLengthOK:
         LD      (HL),A
         DEC     HL
 PrintVariable:
+        PUSH    HL
+        CALL    PrintSign
+        POP     HL
         LD      B,(HL)
         INC     HL
         CALL    PrintBigHex
@@ -278,7 +294,9 @@ ParseAssignment:
         JR	Z,.parseAssig1
         CP	'/'
         JR	Z,.parseAssig1
-        CP	'M'
+        CP      '-'
+        JR      Z,.parseAssig1
+        CP      'M'
 .parseAssig1:
 	POP     HL
         JP      NZ,ParseLiteral
@@ -297,7 +315,9 @@ ParseAddExpression:
         JR	Z,.parseAdd1
         CP	'/'
         JR	Z,.parseAdd1
-        CP	'M'
+        CP      '-'
+        JR      Z,.parseAdd1
+        CP      'M'
 .parseAdd1:
 	SCF
         RET     NZ
@@ -354,27 +374,43 @@ AddSrc2Ready:
         INC     HL
         LD      (Ptr2),HL
         ; Add into a separate work buffer so destination may equal either source.
-        LD	A,(FuncSymb)
-	CP	'+'
-	JR	NZ,.addsrc2_mul
-	CALL	AddToWork
-	JR	.addscr2_ret
+        ; Operand signs are read now, before the destination can be overwritten.
+        LD      A,(Src1Index)
+        CALL    GetVarSign
+        LD      (Sign1),A
+        LD      A,(Src2Index)
+        CALL    GetVarSign
+        LD      (Sign2),A
+        XOR     A
+        LD      (WorkSign),A
+        LD      A,(FuncSymb)
+        CP      '+'
+        JR      NZ,.addsrc2_sub
+        CALL    SignedAdd
+        JR      .addscr2_ret
+.addsrc2_sub:
+        CP      '-'
+        JR      NZ,.addsrc2_mul
+        CALL    SignedSub
+        JR      .addscr2_ret
 .addsrc2_mul:
-	CP	'*'
-	JR	NZ,.addscr2_div
-	CALL	MulToWork
-	JR	.addscr2_ret
+        CP      '*'
+        JR      NZ,.addscr2_div
+        CALL    SignedMul
+        JR      .addscr2_ret
 .addscr2_div:
-	CP	'/'
-	JR	NZ,.addscr2_mod
-	CALL	DivToWork
-	JR	.addscr2_ret
+        CP      '/'
+        JR      NZ,.addscr2_mod
+        CALL    SignedDiv
+        JR      .addscr2_ret
 .addscr2_mod:
-	CP	'M'
-	JR	NZ,.addscr2_ret
-	CALL	ModToWork
+        CP      'M'
+        JR      NZ,.addscr2_ret
+        CALL    SignedMod
 .addscr2_ret:
         RET     C
+        CALL    NormalizeWorkSign   ; a zero result is never negative
+        CALL    SetDestSign
         ; Commit result to destination slot only after successful addition.
         LD      A,(DestIndex)
         CALL    GetVarDataAddress
@@ -403,6 +439,21 @@ CommitDone:
 ; Odd digit count is accepted (e.g. A -> 0A).
 ; -----------------------------------------------------------------------------
 ParseLiteral:
+        ; Optional sign before the digits: '-' = negative, '+' = positive.
+        XOR     A
+        LD      (WorkSign),A
+        LD      A,(HL)
+        CP      '-'
+        JR      NZ,LiteralNotMinus
+        LD      A,1
+        LD      (WorkSign),A
+        INC     HL
+        JR      LiteralSignDone
+LiteralNotMinus:
+        CP      '+'
+        JR      NZ,LiteralSignDone
+        INC     HL
+LiteralSignDone:
         ; Validate RHS length: 1..510 hex digits; calculate ceil(digits/2).
         PUSH    HL
         LD      DE,CmdBuf
@@ -522,6 +573,9 @@ TrimLiteral:
 LiteralTrimDone:
         LD      A,B
         LD      (DestLenTemp),A
+        LD      (WorkLen),A
+        CALL    NormalizeWorkSign   ; -0 becomes 0
+        CALL    SetDestSign
         LD      A,(DestIndex)
         CALL    GetVarDataAddress
         LD      A,(DestLenTemp)
@@ -1334,6 +1388,192 @@ DivCore:
     ret
 
 
+; =============================================================================
+; Signed arithmetic front-ends.
+;
+; Sign1/Sign2 hold the signs of Src1/Src2 (0 = positive, 1 = negative); the
+; magnitudes are at Ptr1/Len1 and Ptr2/Len2. Each routine returns the result
+; magnitude in WorkBuf/WorkLen and its sign in WorkSign. Carry = error.
+;
+; Division truncates toward zero and the remainder takes the sign of the
+; dividend, so  a = (a/b)*b + (a M b)  always holds.
+; =============================================================================
+SignedSub:
+        LD      A,(Sign2)
+        XOR     1
+        LD      (Sign2),A           ; a - b = a + (-b); falls through
+SignedAdd:
+        LD      A,(Sign1)
+        LD      B,A
+        LD      A,(Sign2)
+        CP      B
+        JR      NZ,SignedAddDiff
+        LD      A,B                 ; same sign: add magnitudes, keep the sign
+        LD      (WorkSign),A
+        JP      AddToWork
+SignedAddDiff:
+        CALL    SubMagToWork        ; WorkBuf = |a|-|b|, Carry = (|a| < |b|)
+        JR      C,SignedAddSwap
+        LD      A,(Sign1)           ; |a| >= |b|: result takes the sign of a
+        LD      (WorkSign),A
+        JP      TrimWork
+SignedAddSwap:
+        CALL    NegateWork          ; WorkBuf = |b|-|a|
+        LD      A,(Sign2)           ; |a| < |b|: result takes the sign of b
+        LD      (WorkSign),A
+        JP      TrimWork
+
+SignedMul:
+        LD      A,(Sign1)
+        LD      B,A
+        LD      A,(Sign2)
+        XOR     B
+        LD      (WorkSign),A
+        JP      MulToWork
+
+SignedDiv:
+        LD      A,(Sign1)
+        LD      B,A
+        LD      A,(Sign2)
+        XOR     B
+        LD      (WorkSign),A
+        JP      DivToWork
+
+SignedMod:
+        LD      A,(Sign1)
+        LD      (WorkSign),A
+        JP      ModToWork
+
+; -----------------------------------------------------------------------------
+; SubMagToWork: WorkBuf = |Src1| - |Src2| over L = max(Len1,Len2) bytes (the
+; shorter operand is zero-extended). WorkLen = L (not trimmed).
+; Carry set if |Src1| < |Src2|; WorkBuf then holds 256^L - (|Src2|-|Src1|).
+; Carry is the running borrow, so only flag-neutral instructions (INC/DEC r,
+; LD, EX DE,HL, 16-bit INC) are used between the SBCs.
+; -----------------------------------------------------------------------------
+SubMagToWork:
+        LD      HL,(Ptr1)
+        LD      DE,(Ptr2)
+        LD      A,(Len1)
+        LD      B,A
+        LD      A,(Len2)
+        LD      C,A
+        LD      IX,WorkBuf
+        XOR     A
+        LD      (WorkLen),A         ; also clears the borrow
+SubLoop:
+        INC     B
+        DEC     B
+        JR      Z,SubNoSrc1
+        INC     C
+        DEC     C
+        JR      Z,SubNoSrc2
+        EX      DE,HL               ; HL -> Src2, DE -> Src1
+        LD      A,(DE)
+        SBC     A,(HL)
+        EX      DE,HL
+        INC     HL
+        INC     DE
+        DEC     B
+        DEC     C
+        JR      SubStore
+SubNoSrc2:                          ; only Src1 has data left: a - 0 - borrow
+        LD      A,(HL)
+        SBC     A,0
+        INC     HL
+        DEC     B
+        JR      SubStore
+SubNoSrc1:
+        INC     C
+        DEC     C
+        RET     Z                   ; both exhausted: Carry = final borrow
+        LD      A,0                 ; only Src2 has data left: 0 - b - borrow
+        EX      DE,HL
+        SBC     A,(HL)
+        EX      DE,HL
+        INC     DE
+        DEC     C
+SubStore:
+        LD      (IX+0),A
+        INC     IX
+        LD      A,(WorkLen)
+        INC     A
+        LD      (WorkLen),A
+        JR      SubLoop
+
+; -----------------------------------------------------------------------------
+; NegateWork: WorkBuf = 0 - WorkBuf (two's complement) over WorkLen bytes.
+; -----------------------------------------------------------------------------
+NegateWork:
+        LD      A,(WorkLen)
+        OR      A
+        RET     Z
+        LD      B,A
+        LD      HL,WorkBuf
+        XOR     A                   ; clear Carry
+NegateLoop:
+        LD      A,0
+        SBC     A,(HL)
+        LD      (HL),A
+        INC     HL
+        DJNZ    NegateLoop
+        RET
+
+; -----------------------------------------------------------------------------
+; NormalizeWorkSign: WorkSign = 0 if the WorkBuf magnitude is zero.
+; (Does not depend on the result being trimmed.)
+; -----------------------------------------------------------------------------
+NormalizeWorkSign:
+        LD      A,(WorkLen)
+        OR      A
+        JR      Z,NormalizeZero
+        LD      B,A
+        LD      HL,WorkBuf
+NormalizeLoop:
+        LD      A,(HL)
+        OR      A
+        RET     NZ                  ; non-zero magnitude: keep the sign
+        INC     HL
+        DJNZ    NormalizeLoop
+NormalizeZero:
+        XOR     A
+        LD      (WorkSign),A
+        RET
+
+; A = variable index -> A = its sign. Clobbers DE, HL.
+GetVarSign:
+        LD      E,A
+        LD      D,0
+        LD      HL,NumberSigns
+        ADD     HL,DE
+        LD      A,(HL)
+        RET
+
+; NumberSigns[DestIndex] = WorkSign. Clobbers A, DE, HL.
+SetDestSign:
+        LD      A,(DestIndex)
+        LD      E,A
+        LD      D,0
+        LD      HL,NumberSigns
+        ADD     HL,DE
+        LD      A,(WorkSign)
+        LD      (HL),A
+        RET
+
+; Print '-' if variable DestIndex is negative. Clobbers A, DE, HL.
+PrintSign:
+        LD      A,(DestIndex)
+        LD      E,A
+        LD      D,0
+        LD      HL,NumberSigns
+        ADD     HL,DE
+        LD      A,(HL)
+        OR      A
+        RET     Z
+        LD      A,'-'
+        RST     #10
+        RET
+
 ; -----------------------------------------------------------------------------
 ; Parse exactly two hex digits at HL as a variable index 0..63.
 ; Returns A=index, HL advanced by 2, Carry on error.
@@ -1477,6 +1717,10 @@ WorkLen:        DB 0
 OddDigits:      DB 0
 LiteralByteCount: DB 0
 DestLenTemp:    DB 0
+Sign1:          DB 0	; sign of Src1 (0 +, 1 -)
+Sign2:          DB 0	; sign of Src2
+WorkSign:       DB 0	; sign of the result in WorkBuf
+NumberSigns:	DS VAR_COUNT,0    ; initially all numbers >0, 1 for <0 numbers
 CmdBuf:         DS MAX_LINE+1,0
 WorkBuf:        DS MAX_BYTES,0
 MulTmp:         DS 2*MAX_BYTES,0
