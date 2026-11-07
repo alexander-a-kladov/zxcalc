@@ -45,8 +45,8 @@ MainLoop:
         JR      Z,MainLoop
         CALL    ParseCommand
         JR      C,CommandError
-        LD      HL,OkText
-        CALL    PrintString
+;        LD      HL,OkText
+;       CALL    PrintString
         JR      MainLoop
 
 CommandError:
@@ -81,11 +81,11 @@ ReadKey:
         JP      NC,WaitKeyRelease
         LD      (KeyChar),A
 
-        LD      A,B
-        CP      #27
-        JR      Z,DecodeCapsKey
-        CP      #FF
-        JP      NZ,WaitKeyRelease
+;        LD      A,B
+;        CP      #27
+;        JR      Z,DecodeCapsKey
+;        CP      #FF
+;        JP      NZ,WaitKeyRelease
 
         ; No shift: ENTER or a hexadecimal digit/letter.
         LD      A,(KeyChar)
@@ -107,6 +107,8 @@ DecodeSymbolKey:
         JR	Z,MakeDivision
         CP	'M'
         JR	Z,MakeRemainder
+        CP	'P'
+        JR	Z,DecodeCapsKey
         JR      WaitKeyRelease
 MakePlus:
         LD      A,'+'
@@ -125,7 +127,8 @@ MakeRemainder:
 	JR	StoreCharacter
 DecodeCapsKey:
         LD      A,(KeyChar)
-        CP      '0'
+;        CP      '0'
+	CP	'P'
         JR      Z,BackspaceCharacter
         JR      WaitKeyRelease
 
@@ -1494,3 +1497,4 @@ DivCurrent:     DB 0
 DivMask:        DB 0
 DivBitCount:    DB 0
         SAVESNA "zxcalc.sna",Start
+        SAVEBIN "zxcalc.bin",Start,$-Start
