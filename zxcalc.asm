@@ -13,8 +13,8 @@
 ;   00=01+2B                  add two variables      (signed)
 ;   00=01-2B                  subtract               (signed)
 ;   00=01*2B                  multiply               (signed)
-;   00=01/2B                  divide, truncated toward zero
-;   00=01M2B                  remainder, sign of the dividend (a = (a/b)*b + a M b)
+;   00=01/2B                  divide  (remainder is never negative)
+;   00=01M2B                  remainder, 0 <= r < |b|  (a = (a/b)*b + a M b)
 ;   00                        print a variable (with leading '-' if negative)
 ;
 ; Input uses ROM KEY-SCAN + K-TEST, with one-key-per-press debouncing.
@@ -98,7 +98,7 @@ ReadKey:
         ; No shift: ENTER or a hexadecimal digit/letter.
         LD      A,(KeyChar)
         CP      13
-        JR      Z,ReadDone
+        JP      Z,ReadDone
         CALL    IsHexCharacter
         JR      C,DecodeSymbolKey
         JR      StoreCharacter
@@ -117,8 +117,10 @@ DecodeSymbolKey:
         JR	Z,MakeDivision
         CP	'M'
         JR	Z,MakeRemainder
-        CP	'P'
+        CP	'O'
         JR	Z,DecodeCapsKey
+        CP	'P'
+        JR	Z,CalcPiNumber
         JR      WaitKeyRelease
 MakePlus:
         LD      A,'+'
@@ -141,9 +143,15 @@ MakeRemainder:
 DecodeCapsKey:
         LD      A,(KeyChar)
 ;        CP      '0'
-	CP	'P'
+	CP	'O'
         JR      Z,BackspaceCharacter
         JR      WaitKeyRelease
+CalcPiNumber:
+	LD	HL,PiCalcText
+	CALL	PrintString
+	CALL	CalcPi
+	JP	C,CommandError
+	JP	MainLoop
 
 StoreCharacter:
         LD      C,A
@@ -1395,8 +1403,9 @@ DivCore:
 ; magnitudes are at Ptr1/Len1 and Ptr2/Len2. Each routine returns the result
 ; magnitude in WorkBuf/WorkLen and its sign in WorkSign. Carry = error.
 ;
-; Division truncates toward zero and the remainder takes the sign of the
-; dividend, so  a = (a/b)*b + (a M b)  always holds.
+; The remainder is never negative: 0 <= (a M b) < |b|, and the quotient is
+; rounded to match, so  a = (a/b)*b + (a M b)  always holds (Euclidean
+; division; for b > 0 this is exactly Python's // and %).
 ; =============================================================================
 SignedSub:
         LD      A,(Sign2)
@@ -1437,12 +1446,83 @@ SignedDiv:
         LD      A,(Sign2)
         XOR     B
         LD      (WorkSign),A
-        JP      DivToWork
-
-SignedMod:
+        CALL    DivToWork           ; truncated: |a| = Q*|b| + R
+        RET     C
         LD      A,(Sign1)
+        OR      A
+        RET     Z                   ; a >= 0: truncated == floored
+        LD      HL,DivRem           ; a < 0: if R <> 0 then |q| = Q + 1
+        LD      B,MAX_BYTES
+DivQFixScan:
+        LD      A,(HL)
+        OR      A
+        JR      NZ,DivQFixInc
+        INC     HL
+        DJNZ    DivQFixScan
+        OR      A
+        RET                         ; R = 0: exact, nothing to fix
+DivQFixInc:
+        LD      HL,WorkBuf          ; WorkBuf is zero beyond the quotient
+        LD      B,MAX_BYTES
+DivQIncLoop:
+        INC     (HL)
+        JR      NZ,TrimWorkFull
+        INC     HL
+        DJNZ    DivQIncLoop
+        JR      TrimWorkFull
+
+; Remainder is always >= 0 (0 <= r < |b|), so a = q*b + r holds with the
+; quotient from SignedDiv (q is rounded so that this is true).
+SignedMod:
+        XOR     A
         LD      (WorkSign),A
-        JP      ModToWork
+        CALL    ModToWork           ; truncated remainder R (magnitude)
+        RET     C
+        LD      A,(Sign1)
+        OR      A
+        RET     Z                   ; a >= 0: R is already the answer
+        LD      HL,WorkBuf          ; a < 0: if R <> 0 then r = |b| - R
+        LD      B,MAX_BYTES
+ModFixScan:
+        LD      A,(HL)
+        OR      A
+        JR      NZ,ModFixSub
+        INC     HL
+        DJNZ    ModFixScan
+        OR      A
+        RET
+ModFixSub:
+        LD      HL,WorkBuf
+        LD      DE,DivisorBuf       ; still holds |b|
+        LD      B,MAX_BYTES
+        OR      A
+ModFixLoop:
+        LD      A,(DE)
+        SBC     A,(HL)
+        LD      (HL),A
+        INC     HL
+        INC     DE
+        DJNZ    ModFixLoop
+        ; fall through
+
+; WorkLen = number of significant bytes of WorkBuf (0 if zero). Carry clear.
+TrimWorkFull:
+        LD      HL,WorkBuf+MAX_BYTES-1
+        LD      B,MAX_BYTES
+TrimFullLoop:
+        LD      A,(HL)
+        OR      A
+        JR      NZ,TrimFullFound
+        DEC     HL
+        DJNZ    TrimFullLoop
+        XOR     A
+        LD      (WorkLen),A
+        RET
+TrimFullFound:
+        LD      A,B
+        LD      (WorkLen),A
+        OR      A
+        RET
 
 ; -----------------------------------------------------------------------------
 ; SubMagToWork: WorkBuf = |Src1| - |Src2| over L = max(Len1,Len2) bytes (the
@@ -1687,6 +1767,124 @@ PrintString:
         INC     HL
         JR      PrintString
 
+WriteCmd: ; HL cmd addr, A len
+	PUSH	BC
+	LD	DE,CmdBuf
+	PUSH	HL
+	LD	HL,CmdLen
+	LD	(HL),A
+	POP	HL
+	LD	B,A
+WriteCmdLoop:
+	LD	A,(HL)
+	LD	(DE),A
+	INC	HL
+	INC	DE
+	DJNZ	WriteCmdLoop
+	POP	BC
+	RET
+
+ClearVar: ; A - var index
+	PUSH	AF
+	CALL	GetVarSign ; It changes HL to selected var sign addr
+	LD	A,0
+	LD	(HL),0
+	POP	AF
+	CALL	GetVarDataAddress
+	LD	A,0
+	LD	(HL),A ; zero var len so variable counts as zero I suppose
+	RET
+	
+q_Value:	DB "00=1"
+r_Value:	DB "01=0"
+t_Value:	DB "02=1"
+k_Value:	DB "03=1"
+n_Value:	DB "04=3"
+l_Value:	DB "05=3"
+four_Value:	DB "06=4"
+seven_Value:	DB "07=7"
+one_Value:	DB "08=1"
+two_Value:	DB "09=2"
+ten_Value:	DB "0A=A"
+three_Value:	DB "0B=3"
+null_Value: 	DB "10=0"
+four_mul_q_Value: DB "0C=06*00"
+plus_r_Value:	DB "0C=0C+01"
+minus_t_Value:	DB "0C=0C-02" ; 4 * q + r - t
+n_mul_t_Value:	DB "0D=04*02" ; n * t
+first_Cond_Value: DB "0C=0C-0D" ; 
+new_q_Value:	DB "0C=0A*00" ; new_q = 10*q
+r_minus_n_mul_t_Value:	DB "0D=01-0D"
+new_r_Value:	DB "0D=0A*0D" ; 10 * (r - n * t)
+three_mul_q_Value: DB "0E=0B*00"
+plus_r1_Value: DB "0E=0E+01"
+ten_mul_Value: DB "0E=0A*0E"
+div_t_Value: DB "0E=0E/02"
+ten_mul_n_Value: DB "0F=0A*04"
+new_n_Value: DB "0E=0E-0F" ; (10 * (3 * q + r)) // t - 10 * n
+q_equals_new_Value: DB "00=0C+10" ; q=new_q+0
+r_equals_new_Value: DB "01=0D+10" ; r=new_r+0
+n_equals_new_Value: DB "04=0E+10" ; n=new_n+0
+t_equals_new_Value: DB "02=11+10" ; t=new_t+0
+k_equals_new_Value: DB "03=12+10" ; k=new_k+0
+l_equals_new_Value: DB "05=14+10" ; l=new_l+0
+new_q2_Value: DB "0C=00*03" ; new_q2 = q*k
+two_mul_q_Value: DB "0D=09*00"
+plus_r2_Value: DB "0D=0D+01"
+new_r2_Value: DB "0D=0D*05" ; new_r2 = (2 * q + r) * l
+new_t2_Value: DB "11=02*05" ; new_t2 = t*l
+new_k2_Value: DB "12=03+08" ; new_k2 = k+1
+seven_mul_k_Value: DB "0E=07*03"
+two_plus_Value: DB "0E=0E+09"
+mul_q_Value: DB "0E=0E*00"
+r_mul_l_Value: DB "13=01*05"
+plus_r_mul_l_Value: DB "0E=0E+13"
+new_n2_Value: DB "0E=0E/11" ; (q * (7 * k + 2) + r * l) // (t * l)
+new_l2_Value: DB "14=05+09" ; new_l2 = l+2
+
+
+ MACRO CalcValues ValueName, ValueLen, CountValues 
+ 	LD	HL,ValueName
+	LD	C,CountValues
+.calcValuesLoop
+ 	PUSH	BC
+ 	PUSH	HL
+ 	LD	A, ValueLen : CALL WriteCmd : CALL ParseCommand : LD      IY,#5C3A : RET C
+ 	POP	HL
+ 	LD	BC,ValueLen
+ 	ADD	HL,BC
+ 	POP	BC
+ 	DEC	C
+ 	LD	A,C
+ 	OR	A
+ 	JP	NZ,.calcValuesLoop
+ ENDM
+
+
+CalcPi:
+	CalcValues q_Value, 4, 14
+	LD	B,81	; 81 digits of Pi
+CalcPiLoop:
+	PUSH	BC
+	CalcValues four_mul_q_Value, 8, 5
+	LD	A,$0C : CALL GetVarSign
+	CP	1 ; <0
+	JP	NZ,CalcPiElse1
+	LD	A,4 : CALL GetVarDataAddress : INC HL : LD A,(HL) : ADD A,'0': RST #10 ; get n_Value and print
+	POP	BC : DEC B : PUSH BC
+	CalcValues new_q_Value, 8, 12
+	JP CalcPiCycleEnd	
+CalcPiElse1:
+	CalcValues new_q2_Value, 8, 13
+	CalcValues q_equals_new_Value, 8, 6
+CalcPiCycleEnd:
+	POP	BC
+	LD	A,B
+	OR	A
+	JP	NZ,CalcPiLoop
+	ADD A,13: RST #10
+	RET
+
 ClearScreen:
         CALL	3503
         RET
@@ -1699,6 +1897,7 @@ Title:          DB "ZX BIG INTEGER CALCULATOR",13,0
 Prompt:         DB "> ",0
 OkText:         DB "OK - COMMAND ACCEPTED",13,0
 ErrorText:      DB "ERROR - INVALID COMMAND",13,0
+PiCalcText:	DB "Calculation of 81 digit of Pi",13,0
 
 CmdLen:         DW 0
 KeyChar:        DB 0
