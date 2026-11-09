@@ -16,6 +16,11 @@
 ;   00=01/2B                  divide  (remainder is never negative)
 ;   00=01M2B                  remainder, 0 <= r < |b|  (a = (a/b)*b + a M b)
 ;   00                        print a variable (with leading '-' if negative)
+;   00=P                      pi into variable 00, 250 fractional bytes (key I types 'P')
+;   00=P20                    pi with 20h fractional bytes (1..FA): the variable holds
+;                             floor(pi * 256^n): top byte = 3, then n fraction bytes
+;   00.                       print a variable in decimal as fixed point, e.g.
+;                             3.14159265... (top byte . fraction; key N types '.')
 ;
 ; Input uses ROM KEY-SCAN + K-TEST, with one-key-per-press debouncing.
 ; Commands are parsed and range-checked before execution; accepted commands
@@ -33,6 +38,24 @@ VAR_BASE        EQU     #8600
 VAR_COUNT       EQU     64
 MAX_BYTES       EQU     255
 MAX_LINE        EQU     520
+PI_GUARD        EQU     4                 ; extra low bytes carried while computing pi
+PI_MAXFRAC      EQU     MAX_BYTES-1-PI_GUARD   ; 250 fractional bytes (~602 decimal digits)
+
+; One shift/subtract step of long division by DE (16 bit): A = dividend byte
+; (quotient bits enter at the bottom), HL = running remainder (< DE).
+        MACRO DIVSTEP
+        ADD     A,A
+        ADC     HL,HL
+        JR      C,1F                ; remainder overflowed 16 bits: must subtract
+        SBC     HL,DE               ; Carry is clear here
+        JR      NC,2F
+        ADD     HL,DE               ; did not fit: restore, quotient bit = 0
+        JR      3F
+1:      CCF                         ; Carry was set: clear it, then subtract
+        SBC     HL,DE
+2:      INC     A                   ; quotient bit = 1
+3:
+        ENDM
 
 Start:
         DI
@@ -109,6 +132,10 @@ DecodeSymbolKey:
         JR      Z,MakePlus
         CP      'J'
         JR      Z,MakeMinus
+        CP      'I'
+        JR      Z,MakePiChar
+        CP      'N'
+        JR      Z,MakeDot
         CP      'L'
         JR      Z,MakeEquals
         CP	'G'
@@ -117,10 +144,8 @@ DecodeSymbolKey:
         JR	Z,MakeDivision
         CP	'M'
         JR	Z,MakeRemainder
-        CP	'O'
-        JR	Z,DecodeCapsKey
         CP	'P'
-        JR	Z,CalcPiNumber
+        JR	Z,DecodeCapsKey
         JR      WaitKeyRelease
 MakePlus:
         LD      A,'+'
@@ -130,6 +155,12 @@ MakeEquals:
         JR      StoreCharacter
 MakeMinus:
         LD      A,'-'
+        JR      StoreCharacter
+MakePiChar:                         ; the P key is backspace, so key I types 'P'
+        LD      A,'P'
+        JR      StoreCharacter
+MakeDot:
+        LD      A,'.'
         JR      StoreCharacter
 MakeMultiply:
 	LD	A,'*'
@@ -143,15 +174,9 @@ MakeRemainder:
 DecodeCapsKey:
         LD      A,(KeyChar)
 ;        CP      '0'
-	CP	'O'
+	CP	'P'
         JR      Z,BackspaceCharacter
         JR      WaitKeyRelease
-CalcPiNumber:
-	LD	HL,PiCalcText
-	CALL	PrintString
-	CALL	CalcPi
-	JP	C,CommandError
-	JP	MainLoop
 
 StoreCharacter:
         LD      C,A
@@ -253,6 +278,8 @@ CommandHasIndex:
         LD      A,(HL)
         CP      '='
         JR      Z,ParseAssignment
+        CP      '.'
+        JP      Z,ParseDecimal
         SCF
         RET
 BareVarLengthOK:
@@ -282,6 +309,9 @@ PrintVariable:
 
 ParseAssignment:
         INC     HL                  ; HL -> first RHS character
+        LD      A,(HL)
+        CP      'P'
+        JP      Z,ParsePi
         ; RHS has an expression only in the exact form xx+yy.
         PUSH    HL
         LD      HL,(CmdLen)
@@ -1654,6 +1684,404 @@ PrintSign:
         RST     #10
         RET
 
+; =============================================================================
+; PI by Machin's formula   pi = 16*arctan(1/5) - 4*arctan(1/239)
+;
+; arctan(1/x) = 1/x - 1/(3x^3) + 1/(5x^5) - ...   evaluated in fixed point
+; (little-endian, F fractional bytes, one integer byte on top). Every term needs
+; only "big number / 16-bit number" and an add or subtract, so each term costs
+; O(length) and the series shrink as they go (leading zero bytes are skipped).
+;
+; Working buffers:  S = WorkBuf (sum), P = MulTmp (x^-(2k+1)), T = MulTmp+255.
+; PI_GUARD extra low bytes absorb the truncation errors (a few thousand ulp).
+; Result: variable DestIndex = floor(pi * 256^n), n = PiBytes (1..PI_MAXFRAC).
+; Only IX is used (IY must stay $5C3A for the ROM interrupt/print routines).
+; =============================================================================
+ParsePi:                            ; HL -> 'P' ; command is  DD=P  or  DD=Pn  or  DD=Pnn
+        INC     HL
+        LD      DE,(CmdLen)
+        LD      A,D
+        OR      A
+        JR      NZ,PiBad
+        LD      A,E
+        SUB     4                   ; characters after "DD=P"
+        JR      Z,PiDefault
+        CP      1
+        JR      Z,PiOneDigit
+        CP      2
+        JR      NZ,PiBad
+        LD      A,(HL)
+        CALL    HexToNibble
+        RET     C
+        ADD     A,A
+        ADD     A,A
+        ADD     A,A
+        ADD     A,A
+        LD      D,A
+        INC     HL
+        LD      A,(HL)
+        CALL    HexToNibble
+        RET     C
+        OR      D
+        JR      PiHaveCount
+PiOneDigit:
+        LD      A,(HL)
+        CALL    HexToNibble
+        RET     C
+        JR      PiHaveCount
+PiDefault:
+        LD      A,PI_MAXFRAC
+PiHaveCount:
+        OR      A
+        JR      Z,PiBad
+        CP      PI_MAXFRAC+1
+        JR      NC,PiBad
+        LD      (PiBytes),A
+        JP      ComputePi
+PiBad:
+        SCF
+        RET
+
+ComputePi:
+        LD      A,(PiBytes)
+        ADD     A,PI_GUARD
+        LD      (PiF),A             ; F = fractional bytes used internally (<= 254)
+        INC     A
+        LD      (PiLen),A           ; F+1 bytes including the integer byte
+        LD      HL,WorkBuf          ; S = 0
+        LD      DE,WorkBuf+1
+        LD      BC,MAX_BYTES-1
+        LD      (HL),0
+        LDIR
+        LD      A,1
+        LD      (PiAddFlag),A       ; first term of 16*arctan(1/5) is added
+        LD      A,16
+        LD      BC,5
+        LD      DE,25
+        CALL    PiArctan
+        XOR     A
+        LD      (PiAddFlag),A       ; first term of 4*arctan(1/239) is subtracted
+        LD      A,4
+        LD      BC,239
+        LD      DE,57121
+        CALL    PiArctan
+        ; Result = S without the guard bytes -> variable (length n+1, positive).
+        LD      A,(DestIndex)
+        CALL    GetVarDataAddress
+        LD      A,(PiBytes)
+        INC     A
+        LD      (HL),A
+        INC     HL
+        EX      DE,HL               ; DE -> variable data
+        LD      C,A
+        LD      B,0
+        LD      HL,WorkBuf+PI_GUARD
+        LDIR
+        XOR     A
+        LD      (WorkSign),A
+        CALL    SetDestSign
+        OR      A
+        RET
+
+; S +/-= mult * arctan(1/x).  A = mult, BC = x, DE = x*x, PiAddFlag = sign of first term.
+PiArctan:
+        LD      (PiX2),DE
+        PUSH    BC
+        PUSH    AF
+        LD      HL,MulTmp           ; P = 0
+        LD      DE,MulTmp+1
+        LD      BC,MAX_BYTES-1
+        LD      (HL),0
+        LDIR
+        LD      A,(PiF)
+        LD      E,A
+        LD      D,0
+        LD      HL,MulTmp
+        ADD     HL,DE               ; HL -> integer byte of P
+        POP     AF
+        LD      (HL),A              ; P = mult
+        LD      A,(PiLen)
+        LD      (PiCnt),A
+        LD      HL,MulTmp
+        POP     DE                  ; DE = x
+        CALL    PiDivBuf            ; P = mult / x
+        LD      HL,1
+        LD      (PiOdd),HL
+        CALL    PiTrimP
+PiTerm:
+        LD      A,(PiCnt)
+        OR      A
+        RET     Z                   ; P has become zero: series finished
+        LD      C,A
+        LD      B,0
+        LD      HL,MulTmp
+        LD      DE,MulTmp+MAX_BYTES
+        LDIR                        ; T = P
+        LD      HL,MulTmp+MAX_BYTES
+        LD      DE,(PiOdd)
+        CALL    PiDivBuf            ; T = P / (2k+1)
+        CALL    PiAddSub            ; S +/-= T
+        LD      A,(PiAddFlag)
+        XOR     1
+        LD      (PiAddFlag),A
+        LD      HL,MulTmp
+        LD      DE,(PiX2)
+        CALL    PiDivBuf            ; P = P / x^2
+        CALL    PiTrimP
+        LD      HL,(PiOdd)
+        INC     HL
+        INC     HL
+        LD      (PiOdd),HL
+        JR      PiTerm
+
+; Divide the PiCnt-byte little-endian number at (HL) by DE (1..65535), in place,
+; truncating. Works from the most significant byte down; 8 DIVSTEPs per byte.
+PiDivBuf:
+        LD      A,(PiCnt)
+        LD      C,A
+        LD      B,0
+        ADD     HL,BC
+        DEC     HL
+        PUSH    HL
+        POP     IX                  ; IX -> most significant byte
+        LD      B,C                 ; B = byte count (1..255)
+        LD      HL,0                ; running remainder
+PiDivLoop:
+        LD      A,(IX+0)
+        DUP     8
+        DIVSTEP
+        EDUP
+        LD      (IX+0),A
+        DEC     IX
+        DEC     B
+        JP      NZ,PiDivLoop
+        RET
+
+; PiCnt = number of significant bytes of P (0 if P = 0).
+PiTrimP:
+        LD      A,(PiCnt)
+        OR      A
+        RET     Z
+        LD      B,A
+        LD      E,A
+        LD      D,0
+        LD      HL,MulTmp
+        ADD     HL,DE
+        DEC     HL                  ; HL -> P[PiCnt-1]
+PiTrimLoop:
+        LD      A,(HL)
+        OR      A
+        JR      NZ,PiTrimDone
+        DEC     HL
+        DJNZ    PiTrimLoop
+PiTrimDone:
+        LD      A,B
+        LD      (PiCnt),A
+        RET
+
+; S = S + T (PiAddFlag <> 0) or S - T (PiAddFlag = 0) over the PiCnt low bytes of T,
+; then the carry/borrow is propagated up through the rest of S.
+PiAddSub:
+        LD      A,(PiCnt)
+        LD      B,A
+        LD      C,A
+        LD      HL,WorkBuf
+        LD      DE,MulTmp+MAX_BYTES
+        LD      A,(PiAddFlag)
+        OR      A                   ; also clears Carry
+        JR      Z,PiSubT
+PiAddLoop:
+        LD      A,(DE)
+        ADC     A,(HL)
+        LD      (HL),A
+        INC     HL
+        INC     DE
+        DJNZ    PiAddLoop
+        RET     NC
+        LD      A,(PiLen)
+        SUB     C
+        RET     Z
+        LD      B,A
+PiAddCarry:
+        INC     (HL)
+        RET     NZ
+        INC     HL
+        DJNZ    PiAddCarry
+        RET
+PiSubT:
+        EX      DE,HL               ; HL -> T, DE -> S
+PiSubLoop:
+        LD      A,(DE)
+        SBC     A,(HL)
+        LD      (DE),A
+        INC     HL
+        INC     DE
+        DJNZ    PiSubLoop
+        RET     NC
+        LD      A,(PiLen)
+        SUB     C
+        RET     Z
+        LD      B,A
+PiSubBorrow:
+        LD      A,(DE)
+        SUB     1
+        LD      (DE),A
+        INC     DE
+        RET     NC
+        DJNZ    PiSubBorrow
+        RET
+
+; =============================================================================
+; "DD." - print variable DD in decimal as a fixed-point number: the top byte is
+; the integer part, the bytes below it are the fraction (this is how DD=P stores
+; pi). The fraction is multiplied by 10 repeatedly; the carry out is the next digit.
+; Digits printed = 2.406*F - 4  (the last few digits of the binary value are
+; not trustworthy, so they are not shown).
+; =============================================================================
+ParseDecimal:
+        LD      HL,(CmdLen)
+        LD      DE,3
+        OR      A
+        SBC     HL,DE
+        JR      Z,PrintDecimalVar
+        SCF
+        RET
+
+PrintDecimalVar:
+        CALL    PrintSign
+        LD      A,(DestIndex)
+        CALL    GetVarDataAddress
+        LD      A,(HL)              ; length
+        OR      A
+        JR      NZ,DecHaveLen
+        LD      A,'0'               ; uninitialised slot = 0
+        RST     #10
+        JR      DecNewLine
+DecHaveLen:
+        DEC     A
+        LD      (DecF),A            ; F = number of fraction bytes
+        INC     HL                  ; HL -> byte 0
+        OR      A
+        JR      Z,DecCopied
+        LD      C,A
+        LD      B,0
+        LD      DE,WorkBuf
+        LDIR                        ; fraction -> WorkBuf; HL ends at the integer byte
+DecCopied:
+        LD      A,(HL)              ; integer part
+        CALL    PrintByteDec
+        CALL    DecDigitCount       ; HL = number of fraction digits to print
+        LD      A,H
+        OR      L
+        JR      Z,DecNewLine
+        LD      (DecCount),HL
+        LD      A,'.'
+        RST     #10
+DecDigitLoop:
+        CALL    DecMul10
+        ADD     A,'0'
+        RST     #10
+        LD      HL,(DecCount)
+        DEC     HL
+        LD      (DecCount),HL
+        LD      A,H
+        OR      L
+        JR      NZ,DecDigitLoop
+DecNewLine:
+        LD      A,13
+        RST     #10
+        OR      A
+        RET
+
+; WorkBuf[0..F-1] *= 10 ; returns the carry out (0..9) in A.
+DecMul10:
+        LD      A,(DecF)
+        LD      B,A
+        OR      A
+        RET     Z
+        LD      IX,WorkBuf
+        LD      C,0
+DecMulLoop:
+        LD      L,(IX+0)
+        LD      H,0
+        ADD     HL,HL               ; 2b
+        LD      D,H
+        LD      E,L
+        ADD     HL,HL               ; 4b
+        ADD     HL,HL               ; 8b
+        ADD     HL,DE               ; 10b
+        LD      E,C
+        LD      D,0
+        ADD     HL,DE               ; + carry from the byte below
+        LD      (IX+0),L
+        LD      C,H                 ; carry out (0..9)
+        INC     IX
+        DJNZ    DecMulLoop
+        LD      A,C
+        RET
+
+; HL = max(0, 2F + (13F >> 5) - 4)  with F = DecF
+DecDigitCount:
+        LD      A,(DecF)
+        LD      E,A
+        LD      D,0
+        LD      H,D
+        LD      L,E
+        ADD     HL,HL
+        ADD     HL,HL               ; 4F
+        LD      B,H
+        LD      C,L
+        ADD     HL,HL               ; 8F
+        ADD     HL,BC               ; 12F
+        ADD     HL,DE               ; 13F
+        LD      B,5
+DecShr:
+        SRL     H
+        RR      L
+        DJNZ    DecShr
+        ADD     HL,DE
+        ADD     HL,DE               ; + 2F
+        LD      DE,4
+        OR      A
+        SBC     HL,DE
+        RET     NC
+        LD      HL,0
+        RET
+
+; Print A (0..255) in decimal without leading zeros.
+PrintByteDec:
+        LD      (DecTmp),A
+        XOR     A
+        LD      (DecStarted),A
+        LD      E,100
+        CALL    PbdDigit
+        LD      E,10
+        CALL    PbdDigit
+        LD      A,(DecTmp)
+        ADD     A,'0'
+        RST     #10
+        RET
+PbdDigit:
+        LD      A,(DecTmp)
+        LD      D,0
+PbdSub:
+        CP      E
+        JR      C,PbdGot
+        SUB     E
+        INC     D
+        JR      PbdSub
+PbdGot:
+        LD      (DecTmp),A          ; remainder
+        LD      A,(DecStarted)
+        OR      D
+        RET     Z                   ; leading zero: not printed
+        LD      A,1
+        LD      (DecStarted),A
+        LD      A,D
+        ADD     A,'0'
+        RST     #10
+        RET
+
 ; -----------------------------------------------------------------------------
 ; Parse exactly two hex digits at HL as a variable index 0..63.
 ; Returns A=index, HL advanced by 2, Carry on error.
@@ -1767,124 +2195,6 @@ PrintString:
         INC     HL
         JR      PrintString
 
-WriteCmd: ; HL cmd addr, A len
-	PUSH	BC
-	LD	DE,CmdBuf
-	PUSH	HL
-	LD	HL,CmdLen
-	LD	(HL),A
-	POP	HL
-	LD	B,A
-WriteCmdLoop:
-	LD	A,(HL)
-	LD	(DE),A
-	INC	HL
-	INC	DE
-	DJNZ	WriteCmdLoop
-	POP	BC
-	RET
-
-ClearVar: ; A - var index
-	PUSH	AF
-	CALL	GetVarSign ; It changes HL to selected var sign addr
-	LD	A,0
-	LD	(HL),0
-	POP	AF
-	CALL	GetVarDataAddress
-	LD	A,0
-	LD	(HL),A ; zero var len so variable counts as zero I suppose
-	RET
-	
-q_Value:	DB "00=1"
-r_Value:	DB "01=0"
-t_Value:	DB "02=1"
-k_Value:	DB "03=1"
-n_Value:	DB "04=3"
-l_Value:	DB "05=3"
-four_Value:	DB "06=4"
-seven_Value:	DB "07=7"
-one_Value:	DB "08=1"
-two_Value:	DB "09=2"
-ten_Value:	DB "0A=A"
-three_Value:	DB "0B=3"
-null_Value: 	DB "10=0"
-four_mul_q_Value: DB "0C=06*00"
-plus_r_Value:	DB "0C=0C+01"
-minus_t_Value:	DB "0C=0C-02" ; 4 * q + r - t
-n_mul_t_Value:	DB "0D=04*02" ; n * t
-first_Cond_Value: DB "0C=0C-0D" ; 
-new_q_Value:	DB "0C=0A*00" ; new_q = 10*q
-r_minus_n_mul_t_Value:	DB "0D=01-0D"
-new_r_Value:	DB "0D=0A*0D" ; 10 * (r - n * t)
-three_mul_q_Value: DB "0E=0B*00"
-plus_r1_Value: DB "0E=0E+01"
-ten_mul_Value: DB "0E=0A*0E"
-div_t_Value: DB "0E=0E/02"
-ten_mul_n_Value: DB "0F=0A*04"
-new_n_Value: DB "0E=0E-0F" ; (10 * (3 * q + r)) // t - 10 * n
-q_equals_new_Value: DB "00=0C+10" ; q=new_q+0
-r_equals_new_Value: DB "01=0D+10" ; r=new_r+0
-n_equals_new_Value: DB "04=0E+10" ; n=new_n+0
-t_equals_new_Value: DB "02=11+10" ; t=new_t+0
-k_equals_new_Value: DB "03=12+10" ; k=new_k+0
-l_equals_new_Value: DB "05=14+10" ; l=new_l+0
-new_q2_Value: DB "0C=00*03" ; new_q2 = q*k
-two_mul_q_Value: DB "0D=09*00"
-plus_r2_Value: DB "0D=0D+01"
-new_r2_Value: DB "0D=0D*05" ; new_r2 = (2 * q + r) * l
-new_t2_Value: DB "11=02*05" ; new_t2 = t*l
-new_k2_Value: DB "12=03+08" ; new_k2 = k+1
-seven_mul_k_Value: DB "0E=07*03"
-two_plus_Value: DB "0E=0E+09"
-mul_q_Value: DB "0E=0E*00"
-r_mul_l_Value: DB "13=01*05"
-plus_r_mul_l_Value: DB "0E=0E+13"
-new_n2_Value: DB "0E=0E/11" ; (q * (7 * k + 2) + r * l) // (t * l)
-new_l2_Value: DB "14=05+09" ; new_l2 = l+2
-
-
- MACRO CalcValues ValueName, ValueLen, CountValues 
- 	LD	HL,ValueName
-	LD	C,CountValues
-.calcValuesLoop
- 	PUSH	BC
- 	PUSH	HL
- 	LD	A, ValueLen : CALL WriteCmd : CALL ParseCommand : LD      IY,#5C3A : RET C
- 	POP	HL
- 	LD	BC,ValueLen
- 	ADD	HL,BC
- 	POP	BC
- 	DEC	C
- 	LD	A,C
- 	OR	A
- 	JP	NZ,.calcValuesLoop
- ENDM
-
-
-CalcPi:
-	CalcValues q_Value, 4, 14
-	LD	B,81	; 81 digits of Pi
-CalcPiLoop:
-	PUSH	BC
-	CalcValues four_mul_q_Value, 8, 5
-	LD	A,$0C : CALL GetVarSign
-	CP	1 ; <0
-	JP	NZ,CalcPiElse1
-	LD	A,4 : CALL GetVarDataAddress : INC HL : LD A,(HL) : ADD A,'0': RST #10 ; get n_Value and print
-	POP	BC : DEC B : PUSH BC
-	CalcValues new_q_Value, 8, 12
-	JP CalcPiCycleEnd	
-CalcPiElse1:
-	CalcValues new_q2_Value, 8, 13
-	CalcValues q_equals_new_Value, 8, 6
-CalcPiCycleEnd:
-	POP	BC
-	LD	A,B
-	OR	A
-	JP	NZ,CalcPiLoop
-	ADD A,13: RST #10
-	RET
-
 ClearScreen:
         CALL	3503
         RET
@@ -1897,7 +2207,6 @@ Title:          DB "ZX BIG INTEGER CALCULATOR",13,0
 Prompt:         DB "> ",0
 OkText:         DB "OK - COMMAND ACCEPTED",13,0
 ErrorText:      DB "ERROR - INVALID COMMAND",13,0
-PiCalcText:	DB "Calculation of 81 digit of Pi",13,0
 
 CmdLen:         DW 0
 KeyChar:        DB 0
@@ -1939,5 +2248,16 @@ DivSrcLeft:     DB 0
 DivCurrent:     DB 0
 DivMask:        DB 0
 DivBitCount:    DB 0
+PiBytes:        DB 0                ; requested fractional bytes
+PiF:            DB 0                ; fractional bytes used internally (PiBytes + PI_GUARD)
+PiLen:          DB 0                ; PiF + 1
+PiCnt:          DB 0                ; significant bytes of P
+PiAddFlag:      DB 0                ; 1 = add the next term, 0 = subtract it
+PiOdd:          DW 0                ; 2k+1
+PiX2:           DW 0                ; x*x
+DecF:           DB 0
+DecTmp:         DB 0
+DecStarted:     DB 0
+DecCount:       DW 0
         SAVESNA "zxcalc.sna",Start
         SAVEBIN "zxcalc.bin",Start,$-Start
