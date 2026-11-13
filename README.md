@@ -2,7 +2,7 @@
 
 ; -----------------------------------------------------------------------------
 
-; ZX BIG INTEGER CALCULATOR for ZX Spectrum 128
+; ZX BIG INTEGER CALCULATOR for ZX Spectrum 48
 
 ; SjASMPlus source. Variables: $8600-$C5FF (64 slots x 256 bytes)
 
